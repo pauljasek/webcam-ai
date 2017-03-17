@@ -27,9 +27,12 @@ MAX_GENERATED_IMAGES_LENGTH = 100
 RECENT_IN_BATCH = 1
 OLD_IN_BATCH = 9
 BATCH_SIZE = RECENT_IN_BATCH + OLD_IN_BATCH
-TIME_SIZE = 20
+TIME_SIZE = 15
 
-MAIN_ACTIVATION = tf.nn.elu
+LOOK_AHEAD = TIME_SIZE - 1
+SIMILARITY_CHECK_STEPS = 50
+
+MAIN_ACTIVATION = tf.nn.relu
 
 def linear(x):
     return x
@@ -80,9 +83,11 @@ class Deconv():
         self.batch_size = tf.shape(i)[0]
         self.deconv_shape = tf.stack([self.batch_size, output_shape[1], output_shape[2], output_shape[3]])
         
-        self.out = activation(tf.nn.conv2d_transpose(i, self.deconv_filter, self.deconv_shape, strides=[1,self.strides,self.strides,1], padding='SAME') + self.deconv_bias)
+        self.out = self.apply(i)
     
     def apply(self, i):
+        self.batch_size = tf.shape(i)[0]
+        self.deconv_shape = tf.stack([self.batch_size, self.output_shape[1], self.output_shape[2], self.output_shape[3]])
         return self.activation(tf.nn.conv2d_transpose(i, self.deconv_filter, self.deconv_shape, strides=[1,self.strides,self.strides,1], padding='SAME') + self.deconv_bias)
 
     def get_shape(self):
@@ -155,7 +160,7 @@ output, output_state = tf.nn.dynamic_rnn(gru, observations, time_major=False, in
 
 print(output.get_shape())
 
-output_reshaped = tf.reshape(output, [batch_size*time_size, STATE_SIZE])
+output_reshaped = tf.reshape(output, [-1, STATE_SIZE])
 
 
 start = Fc(MAIN_ACTIVATION, output_reshaped, final_size)
@@ -177,9 +182,28 @@ train_autoencoder = tf.train.AdamOptimizer(learning_rate=0.001).minimize(autoenc
 fc1 = Fc(MAIN_ACTIVATION, output_reshaped, STATE_SIZE * 2)
 fc2 = Fc(MAIN_ACTIVATION, fc1.out, STATE_SIZE * 2)
 
-predicted_state = Fc(linear, fc2.out, STATE_SIZE)
+predicted_state = Fc(tf.tanh, fc2.out, STATE_SIZE)
 
-next_state = tf.placeholder(tf.float32, [None, STATE_SIZE])
+first_states = tf.reshape(tf.slice(output, [0,0,0], [-1, 1, STATE_SIZE]), [-1,STATE_SIZE])
+
+look_ahead_predictions = [predicted_state.apply(fc2.apply(fc1.apply(first_states)))]
+for i in range(LOOK_AHEAD-1):
+    look_ahead_predictions.append(predicted_state.apply(fc2.apply(fc1.apply(look_ahead_predictions[i]))))
+look_ahead_predictions = tf.stack(look_ahead_predictions, axis=1)
+
+print(look_ahead_predictions.get_shape())
+
+truth_predictions = tf.stop_gradient(tf.slice(output, [0,1,0], [-1, LOOK_AHEAD, STATE_SIZE]))
+
+similarity_checks = [predicted_state.apply(fc2.apply(fc1.apply(first_states)))]
+for i in range(SIMILARITY_CHECK_STEPS-1):
+    similarity_checks.append(predicted_state.apply(fc2.apply(fc1.apply(similarity_checks[i]))))
+similarity_checks = tf.stack(similarity_checks, axis=1)
+
+#prediction_difference = tf.reduce_sum(tf.square(tf.slice(similarity_checks,[0,1,0],[-1,SIMILARITY_CHECK_STEPS-1,STATE_SIZE]) - tf.stop_gradient(tf.slice(similarity_checks, [0,0,0], [-1,SIMILARITY_CHECK_STEPS-1,STATE_SIZE]))))
+_, deviation_in_predictions = tf.nn.moments(tf.reshape(similarity_checks, [-1,STATE_SIZE]), axes=[1])
+
+next_state = tf.placeholder(tf.float32, [None, None, STATE_SIZE])
 
 #pstate_reshaped = tf.reshape(output, [batch_size*time_size, STATE_SIZE])
 
@@ -191,6 +215,19 @@ pdeconv2 = deconv2.apply(pdeconv1)
 pdeconv3 = deconv3.apply(pdeconv2)
 pautoencoder_output = autoencoder_output.apply(pdeconv3)
 
+prediction_loss = tf.reduce_sum(tf.square(tf.reshape(next_state, [-1, STATE_SIZE]) - predicted_state.out))
+train_prediction = tf.train.AdamOptimizer(learning_rate=0.001).minimize(prediction_loss)
+
+look_ahead_loss = tf.reduce_sum(tf.square(truth_predictions - look_ahead_predictions))
+similarity_loss = -tf.reduce_sum(deviation_in_predictions) #1.0/(prediction_difference + .0000001)
+
+combined_train = tf.train.AdamOptimizer(learning_rate=0.001).minimize(autoencoder_loss + prediction_loss + look_ahead_loss + similarity_loss)
+
+
+previous_state = tf.placeholder(tf.float32, [None, STATE_SIZE])
+imagined_image = autoencoder_output.apply(deconv3.apply(deconv2.apply(deconv1.apply(
+        tf.reshape(start.apply(previous_state), conv4.get_reshape())))))
+predicted_next_state = predicted_state.apply(fc2.apply(fc1.apply(previous_state)))
 
 sess = tf.Session()
 sess.run(tf.global_variables_initializer())
@@ -199,8 +236,13 @@ vc = cv2.VideoCapture(0) #("star_wars_lightsaber_duel_trimmed.mp4")
 
 time = -1
 
-zero_state = np.zeros([BATCH_SIZE, STATE_SIZE], np.float32)
+batch_zero_state = np.zeros([BATCH_SIZE, STATE_SIZE], np.float32)
+past_zero_state = np.zeros([OLD_IN_BATCH, STATE_SIZE], np.float32)
+recent_zero_state = np.zeros([RECENT_IN_BATCH, STATE_SIZE], np.float32)
+zero_state = np.zeros([1, STATE_SIZE], np.float32)
+
 gru_state = np.zeros([1, STATE_SIZE], np.float32)
+imagination_state = gru_state.copy()
 
 while True:
     time += 1
@@ -214,11 +256,6 @@ while True:
     while len(images) > MAX_IMAGES_LENGTH:
         images.pop(0)
         
-    if SHOW_IMAGE:
-        display_image = cv2.resize(image, (640,480))
-        cv2.imshow('Web Cam Feed', display_image)
-        if not KEY_INPUT:
-            cv2.waitKey(1)
     
     if False and SHOW_FILTERS:
         out_filters = sess.run(conv3.out, feed_dict={input_image: [image]}) 
@@ -234,46 +271,12 @@ while True:
         
         hand_open = key == ord('1')
         hand_closed = key == ord('0')
-    
-    if time < TRAIN_TIME and time > BATCH_SIZE and time > TIME_SIZE:
-        print(time);
-        #sess.run(train_autoencoder, feed_dict={input_image: [image], previous_state: [pstate], truth_image: [image]})
-        image_batch = []
-        #image_batch.append(images[len(images)-TIME_SIZE:])
-        
-        for i in range(RECENT_IN_BATCH):
-            index = len(images) - i
-            image_batch.append(images[index-TIME_SIZE:index])
 
-
-        for i in range(OLD_IN_BATCH):
-            random_index = random.randint(TIME_SIZE, len(images)-1)
-            image_batch.append(images[random_index-TIME_SIZE:random_index])
-        
-#        for i in range(OLD_IN_BATCH):
- #           random_image = images[random.randint(0, len(images) - 1)]
-  #          image_batch.append(random_image)
-
-        sess.run(train_autoencoder, feed_dict={input_images: image_batch, truth_images: image_batch, state: zero_state})
-      
-    elif time == TRAIN_TIME:
-        #vc = cv2.VideoCapture(0)
-        sleep(3)
-    
-    if False and time % 10 == 0:
-        print(time)
-        print(sess.run(state, feed_dict={input_image: [image], previous_state:[pstate]}))
-        
-    #print(sess.run(batch_size, feed_dict={input_images: [images[len(images)-BATCH_SIZE:]]}))
-    #print(sess.run(time_size, feed_dict={input_images: [images[len(images)-BATCH_SIZE:]]}))
-    #pstate, generated_image = sess.run([state, autoencoder_output.out], feed_dict={input_image: [image], previous_state: [pstate]})
     generated_image, gru_state, predicted_image = sess.run([autoencoder_output.out, output, pautoencoder_output], feed_dict={input_images: [[images[len(images)-1]]], state: gru_state})
     
     gru_state = gru_state[0]
     print(gru_state)
     
-    print(len(predicted_image))
-
     generated_image = generated_image[len(generated_image) - 1]
     predicted_image = predicted_image[len(predicted_image) - 1]
     
@@ -284,8 +287,50 @@ while True:
     display_generated = cv2.resize(generated_image, (640,480))
     display_predicted = cv2.resize(predicted_image, (640,480))
     
+    
+    if time < TRAIN_TIME and time > BATCH_SIZE and time > TIME_SIZE:
+        print(time);
+        image_batch = []
+        
+        for i in range(RECENT_IN_BATCH):
+            index = len(images) - i
+            image_sequence = images[index-TIME_SIZE:index]
+            image_batch.append(image_sequence)
+
+        for i in range(OLD_IN_BATCH):
+            random_index = random.randint(TIME_SIZE, len(images)-1)
+            #image_batch.append(images[random_index-TIME_SIZE:random_index])
+            image_sequence = images[random_index-TIME_SIZE:random_index]
+            image_batch.append(image_sequence)
+        
+        
+        target_states = sess.run(output, feed_dict={input_images: image_batch, state: batch_zero_state})
+        for t in target_states:
+            t = t[1:]
+        
+        for i in image_batch:
+            i = i[:len(i)-1]
+
+        sess.run(combined_train, feed_dict={input_images: image_batch, truth_images: image_batch, state: batch_zero_state, next_state: target_states})
+        
+    elif time == TRAIN_TIME:
+        #vc = cv2.VideoCapture(0)
+        sleep(0.1)
+    
+    imagination_state, imagined = sess.run([predicted_next_state, imagined_image], feed_dict={previous_state: imagination_state})
+    imagined = imagined[0]
+    
+    if (time % 50 == 0):
+        imagination_state = gru_state.copy()
+    
+    cv2.imshow('Predicted Image Stream', cv2.resize(imagined, (640,480)))
     cv2.imshow('Generated Image', display_generated)
     cv2.imshow('Predicted Image', display_predicted)
+    
+    if SHOW_IMAGE:
+        display_image = cv2.resize(image, (640,480))
+        cv2.imshow('Web Cam Feed', display_image)
+
     cv2.waitKey(1)
 
-    
+cv2.destroyAllWindows()
